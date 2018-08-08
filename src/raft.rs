@@ -28,7 +28,7 @@
 use std::cmp;
 
 use eraftpb::{Entry, EntryType, HardState, Message, MessageType, Snapshot};
-use fxhash::FxHashMap;
+use fxhash::{FxHashMap, FxHashSet};
 use protobuf::RepeatedField;
 use rand::{self, Rng};
 
@@ -1843,6 +1843,97 @@ impl<T: Storage> Raft<T> {
         self.prs().voters().contains_key(&self.id)
     }
 
+    /// Set the node group via joint consensus.
+    ///
+    /// This will add and remove nodes in order to reflect the desired state. This process is not
+    /// immediate.
+    ///
+    /// * Learners:
+    ///     + n ∉ self.learners, n ∈ new.learners: Add as learner.
+    ///     + n ∈ self.learners, n ∈ new.voters: Promote learner to voter.
+    ///     + n ∈ self.learners, n ∉ new.learners: Remove from learners.
+    ///     + Else: No action.
+    /// * Voters:
+    ///     + n ∉ self.learners, n ∈ new.voters: Add node as voter.
+    ///     + n ∈ self.voters, n ∉ new.voters: Remove from voters.
+    ///     + Else: No action.
+    ///
+    /// TODO: How to figure out when done?
+    pub fn set_nodes(&mut self, submitted_nodes: impl IntoIterator<Item=u64>) {
+        let submitted_nodes = submitted_nodes.into_iter().collect::<FxHashSet<u64>>();
+        debug!("Determining joint configuration state");
+
+        let old_learners = self.prs().learners()
+            .keys().cloned().collect::<FxHashSet<u64>>();
+        let old_voters = self.prs().voters()
+            .keys().cloned().collect::<FxHashSet<u64>>();
+        let old_nodes = old_learners.union(&old_voters)
+            .cloned().collect::<FxHashSet<u64>>();
+
+        // Brand new nodes never before seen.
+        let new_learners = old_nodes.difference(&submitted_nodes)
+            .cloned().collect::<FxHashSet<u64>>();
+        // Nodes which have been set before but can be promoted.
+        let new_voters = old_voters.intersection(&submitted_nodes)
+            .cloned()
+            .filter(|node| self.prs().voters().contains_key(node))
+            .collect::<FxHashSet<u64>>();
+        let new_nodes = new_learners.union(&new_voters)
+            .cloned().collect::<FxHashSet<u64>>();
+        // Sanity check
+        assert_eq!(submitted_nodes,
+                   new_nodes,
+                   "Calculated new nodes should be identical to what was passed.");
+
+        let union_learners = old_learners.union(&new_learners)
+            .cloned().collect::<FxHashSet<u64>>();
+        let union_voters = old_voters.union(&new_voters)
+            .cloned().collect::<FxHashSet<u64>>();
+        let union_nodes = union_learners.union(&union_voters)
+            .cloned().collect::<FxHashSet<u64>>();
+        assert_eq!(union_nodes,
+                   new_nodes.union(&old_nodes).cloned().collect(),
+                   "Calculated union nodes should be identical to union of old and new nodes.");
+
+        debug!("Joint Learners: {:?}", union_learners);
+        debug!("Joint Voters: {:?}", union_voters);
+        // Apply this new configuration.
+
+        // TODO: Hook the C_new
+        unimplemented!();
+    }
+
+    /// Adds a new node to the cluster.
+    #[deprecated(since = "0.4.0", note = "Please use `set_nodes` instead")]
+    pub fn add_node(&mut self, id: u64) {
+        let peers = self.prs().clone();
+        let voters = peers.voters().keys().cloned();
+        let learners = peers.learners().keys().cloned();
+        let new_id_iter = vec![id].into_iter();
+
+        self.set_nodes(voters.into_iter().chain(learners).chain(new_id_iter));
+    }
+
+    /// Adds a learner node.
+    #[deprecated(since = "0.4.0", note = "Please use `set_nodes` instead")]
+    pub fn add_learner(&mut self, id: u64) {
+        #[allow(deprecated)]
+        self.add_node(id);
+    }
+
+    /// Removes a node from the raft.
+    #[deprecated(since = "0.4.0", note = "Please use `set_nodes` instead")]
+    pub fn remove_node(&mut self, id: u64) {
+        let peers = self.prs().clone();
+        let voters = peers.voters().keys().cloned().collect::<Vec<u64>>();
+        let learners = peers.learners().keys().cloned().collect::<Vec<u64>>();
+        self.set_nodes(
+            voters.into_iter().chain(learners).filter(|&v| v != id),
+        )
+    }
+
+    #[deprecated(since = "0.4.0", note = "Please use `set_nodes` instead")]
+    #[allow(unused)]
     fn add_voter_or_learner(&mut self, id: u64, is_learner: bool) {
         if self.prs().voters().contains_key(&id) {
             if is_learner {
@@ -1875,18 +1966,8 @@ impl<T: Storage> Raft<T> {
         self.mut_prs().get_mut(id).unwrap().recent_active = true;
     }
 
-    /// Adds a new node to the cluster.
-    pub fn add_node(&mut self, id: u64) {
-        self.add_voter_or_learner(id, false);
-    }
 
-    /// Adds a learner node.
-    pub fn add_learner(&mut self, id: u64) {
-        self.add_voter_or_learner(id, true);
-    }
-
-    /// Removes a node from the raft.
-    pub fn remove_node(&mut self, id: u64) {
+    fn remove_node_old(&mut self, id: u64) {
         self.mut_prs().remove(id);
 
         // do not try to commit or abort transferring if there are no nodes in the cluster.
@@ -1931,7 +2012,7 @@ impl<T: Storage> Raft<T> {
         self.prs = Some(prs);
     }
 
-    /// Returns a read-only reference to the progress set.
+    /// Returns a read-only refereeeronce to the progress set.
     pub fn prs(&self) -> &ProgressSet {
         self.prs.as_ref().unwrap()
     }

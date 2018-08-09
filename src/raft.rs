@@ -650,6 +650,7 @@ impl<T: Storage> Raft<T> {
     /// Returns true to indicate that there will probably be some readiness need to be handled.
     pub fn tick_election(&mut self) -> bool {
         self.election_elapsed += 1;
+        info!("ELECTION TICK: pass_timeout: {}, promotable: {}", self.pass_election_timeout(), self.promotable());
         if !self.pass_election_timeout() || !self.promotable() {
             return false;
         }
